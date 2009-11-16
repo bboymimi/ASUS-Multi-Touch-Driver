@@ -23,12 +23,36 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/usb/input.h>
+#include <asm/uaccess.h>
+
+#define DRIVER_VERSION "v0.1"
+#define DRIVER_AUTHOR "Gavin Guo, mimi0213kimo@gmail.com"
+#define DRIVER_DESC "Asus USB Multi-Touch Touch Panel driver"
+#define DRIVER_LICENSE "GPL"
+
+
+MODULE_AUTHOR(DRIVER_AUTHOR);
+MODULE_DESCRIPTION(DRIVER_DESC);
+MODULE_LICENSE(DRIVER_LICENSE);
 
 #define USB_VENDOR_ID_ASUS 0x0486
 #define USB_DEVICE_ID_ASUS 0x0185
 #define VAIO_RDESC_CONSTANT 0x0001
 
-MODULE_LICENSE("GPL");
+
+#define ASUS_MT_STRING "asus_mt"
+#define MAXQUEUE 100
+#define DATANUM 4
+u8 axies_data[DATANUM];
+static int asus_mt_major;
+static struct class *asus_mt_class;
+static int head = 0, tail = 0;
+static int ready = 0;
+
+typedef struct DataQueue {
+	u32 axies_data[DATANUM];
+}DataQueue;
+DataQueue queue[MAXQUEUE];
 
 static int swap_xy;
 module_param(swap_xy, bool, 0644);
@@ -46,7 +70,7 @@ struct asus_mt_usb {
 	char phys1[64];
 	int x1, y1;
 	int x2, y2;
-	int touch, press;
+	int touch1, touch2, press;
 	int p2;
 };
 struct asmt_device_info {
@@ -68,6 +92,80 @@ struct asmt_device_info {
 	int  (*read_data)   (struct asus_mt_usb *asmt, unsigned char *pkt);
 	int  (*init)        (struct asus_mt_usb *asmt);
 };
+
+static int insert_queue()
+{	
+	if((head+1) == tail) {
+		printk("DataQueue is full, some data is losed\n");
+		return -1;
+	} else {
+		head = (head + 1) % MAXQUEUE;
+		int i = 0;
+		for(; i < DATANUM; i++) {
+
+			queue[head].axies_data[i] = axies_data[i];
+		}
+	}
+	return 0;
+}
+
+static int delete_queue(unsigned long arg) 
+{
+	if(head == tail) {
+		goto empty;
+	} else {
+		tail = (tail + 1) % MAXQUEUE;
+		if(copy_to_user((unsigned int *)arg, queue[tail].axies_data, sizeof(u8)*DATANUM)) {
+			printk("error copy_to_user\n");
+			return -EFAULT;
+		}
+		return 0;
+	}
+empty:
+	printk("New data have not been coming yet..\n");
+	return -1;
+}
+
+static int asus_mt_ioctl(struct inode *inode, struct file *file,
+				unsigned int cmd, unsigned long arg)
+{
+	ready = 0;
+	printk("asus_mt...ioctl\n");
+
+	switch(cmd) {
+	
+	case 0:
+		printk("delete_queue\n");
+		delete_queue(arg);
+		break;
+	case 1:
+		printk("query if queue has data\n");
+		if(head == tail)
+			*(unsigned int*)arg = (unsigned int)0;
+		else
+			*(unsigned int*)arg = (unsigned int)1;
+		break;
+	}
+	return 0;
+}
+
+static int asus_mt_open(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static int asus_mt_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static struct file_operations asus_mt_fops = {
+	.owner = THIS_MODULE,
+	.ioctl = asus_mt_ioctl,
+	.open = asus_mt_open,
+	.release = asus_mt_release,
+};
+
 static int asus_read_data(struct asus_mt_usb *dev, unsigned char *pkt)
 {
 	/*
@@ -78,17 +176,27 @@ static int asus_read_data(struct asus_mt_usb *dev, unsigned char *pkt)
 	dev->y = ((pkt[1] & 0x1F) << 7) | (pkt[3] & 0x7F);
 	dev->touch = pkt[0] & 0x20;
 	*/
-	dev->x1 = ((pkt[4] & 0x0F) << 8) | (pkt[3] & 0xFF);
-	dev->y1 = ((pkt[6] & 0x0F) << 8) | (pkt[5] & 0xFF);
+
+	axies_data[0] = pkt[4];
+	axies_data[1] = pkt[5] & 0x0F;
+	axies_data[2] = pkt[6];
+	axies_data[3] = pkt[7] & 0x0F;
+	insert_queue();
+
+	dev->x1 = ((pkt[5] & 0x0F) << 8) | (pkt[4] & 0xFF);
+	dev->y1 = ((pkt[7] & 0x0F) << 8) | (pkt[6] & 0xFF);
+	dev->touch1 = pkt[1] & 0x03;
 	
-	dev->p2 = pkt[13] & 0x02;
+	dev->p2 = pkt[15] & 0x02;
 
 	if(dev->p2) {
-		dev->x2 = ((pkt[10] & 0x0F) << 8) | (pkt[9] & 0xFF);
-		dev->y2 = ((pkt[12] & 0x0F) << 8) | (pkt[11] & 0xFF);
+		dev->x2 = ((pkt[12] & 0x0F) << 8) | (pkt[11] & 0xFF);
+		dev->y2 = ((pkt[14] & 0x0F) << 8) | (pkt[13] & 0xFF);
+		dev->touch2 = pkt[8] & 0x03;
 	}
 	return 1;
 }
+
 static struct asmt_device_info type = {
 		.min_xc		= 0x0,
 		.max_xc		= 0x0fff,
@@ -106,8 +214,8 @@ static void usbtouch_process_pkt(struct asus_mt_usb *asmt,
 	if (!type->read_data(asmt, pkt))
 			return;
 
-	input_report_key(asmt->input1, BTN_TOUCH, asmt->touch);
-	input_report_key(asmt->input2, BTN_TOUCH, asmt->touch);
+	input_report_key(asmt->input1, BTN_TOUCH, asmt->touch1);
+	input_report_key(asmt->input2, BTN_TOUCH, asmt->touch2);
 
 	if (swap_xy) {
 		input_report_abs(asmt->input1, ABS_X, asmt->y1);
@@ -170,9 +278,10 @@ static void asus_mt_irq(struct urb *urb)
 		goto resubmit;
 	}
 
-	printk("data = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", data[0],\
+	printk("data = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", data[0],\
 			data[1],data[2],data[3],\
-			data[4],data[5],data[6],data[7],data[8],data[9],data[10],data[11],data[12],data[13]);
+			data[4],data[5],data[6],data[7],data[8],data[9],data[10],data[11],data[12],data[13],\
+			data[14],data[15]);
 	//printk("%s:urb->actual_length = %d\n", __FUNCTION__, urb->actual_length );
 	asmt->type->process_pkt(asmt, asmt->data, urb->actual_length);
 	resubmit:
@@ -185,10 +294,38 @@ static void asus_mt_irq(struct urb *urb)
 static int asus_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	printk("%s\n", __FUNCTION__);
+	int ret = 0;
+	struct device *temp_class;
 	struct usb_host_interface *interface = intf->cur_altsetting;
 	struct usb_device *dev = interface_to_usbdev(intf);
 	struct input_dev *input_dev1, *input_dev2;
-	int n = 0, insize = 14;
+	int n = 0, insize = 16;
+
+	asus_mt_major = register_chrdev(0, ASUS_MT_STRING,
+			&asus_mt_fops);
+	
+	if(asus_mt_major < 0) {
+		printk("Unable to get a major for asus multi-touch driver!\n");	
+		return asus_mt_major;
+	}
+	
+	asus_mt_class = class_create(THIS_MODULE, ASUS_MT_STRING);
+
+	if(IS_ERR(asus_mt_class)) {
+		printk(KERN_ERR "Error creating Asus Multi-Touch class.\n");
+		ret = PTR_ERR(asus_mt_class);
+		goto err_out1;
+	}	
+
+	temp_class = device_create(asus_mt_class, NULL,
+					MKDEV(asus_mt_major, 0),
+					NULL,  ASUS_MT_STRING);
+	
+	if(IS_ERR(temp_class)) {
+		printk(KERN_ERR "Error creating Asus Multi-Touch class device.\n");
+		ret = PTR_ERR(temp_class);
+		goto err_out2;
+	}
 
 	struct asus_mt_usb *asmt = kzalloc(sizeof(struct asus_mt_usb), GFP_KERNEL);
 	asmt->type = &type;
@@ -303,6 +440,10 @@ fail1:
 	input_free_device(input_dev1);
 	input_free_device(input_dev2);
 	kfree(asmt);
+err_out2:
+	class_destroy(asus_mt_class);
+err_out1:
+	unregister_chrdev(asus_mt_major, ASUS_MT_STRING);
 	return 1;
 }
 
