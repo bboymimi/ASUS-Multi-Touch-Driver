@@ -70,8 +70,11 @@ struct asus_mt_usb {
 	char phys1[64];
 	int x1, y1;
 	int x2, y2;
+	int tag1, tag2;
 	int touch1, touch2, press;
 	int p2;
+	char input1_map_tag, input2_map_tag;
+	char tag_array[5];
 };
 struct asmt_device_info {
 	int min_xc, max_xc;
@@ -186,13 +189,15 @@ static int asus_read_data(struct asus_mt_usb *dev, unsigned char *pkt)
 	dev->x1 = ((pkt[5] & 0x0F) << 8) | (pkt[4] & 0xFF);
 	dev->y1 = ((pkt[7] & 0x0F) << 8) | (pkt[6] & 0xFF);
 	dev->touch1 = pkt[1] & 0x03;
-	
+	dev->tag1 = pkt[3];	
+
 	dev->p2 = pkt[15] & 0x02;
 
 	if(dev->p2) {
 		dev->x2 = ((pkt[12] & 0x0F) << 8) | (pkt[11] & 0xFF);
 		dev->y2 = ((pkt[14] & 0x0F) << 8) | (pkt[13] & 0xFF);
 		dev->touch2 = pkt[8] & 0x03;
+		dev->tag2 = pkt[10];
 	}
 	return 1;
 }
@@ -213,9 +218,110 @@ static void usbtouch_process_pkt(struct asus_mt_usb *asmt,
 
 	if (!type->read_data(asmt, pkt))
 			return;
+	/*
+	 *	Begin to search for tag array
+ 	 *	which stores the event mapped to tag
+ 	 */	
+	
+	/*
+ 	 *	if touch is released then we must clear releated data.
+ 	 */
+	if (!asmt->touch1) {
+		if(asmt->tag_array[asmt->tag1] == 1)
+			asmt->input1_map_tag = 0;
+		else
+			asmt->input2_map_tag = 0;
 
-	input_report_key(asmt->input1, BTN_TOUCH, asmt->touch1);
-	input_report_key(asmt->input2, BTN_TOUCH, asmt->touch2);
+		asmt->tag_array[asmt->tag1] = 0;
+	}
+
+	if (!asmt->touch2) {
+		if(asmt->tag_array[asmt->tag2] == 1)
+			asmt->input1_map_tag = 0;
+		else
+			asmt->input2_map_tag = 0;
+
+		asmt->tag_array[asmt->tag2] = 0;
+	}
+
+	/*
+ 	 *	if tag1 already bind to event
+ 	 */ 
+
+
+	if (asmt->tag_array[asmt->tag1] != 0x0000) {
+		if(asmt->tag_array[asmt->tag1] == 1) {
+			input_report_key(asmt->input1, BTN_TOUCH, asmt->touch1);
+			input_report_abs(asmt->input1, ABS_X, asmt->x1);
+			input_report_abs(asmt->input1, ABS_Y, asmt->y1);
+			input_sync(asmt->input1);
+		} else {
+			input_report_key(asmt->input2, BTN_TOUCH, asmt->touch1);
+			input_report_abs(asmt->input2, ABS_X, asmt->x1);
+			input_report_abs(asmt->input2, ABS_Y, asmt->y1);
+			input_sync(asmt->input2);
+		}
+	} else {
+		/* 
+     		 *   find a event which is not used
+     		 */
+
+		if (asmt->input1_map_tag != 0x0000) {
+			asmt->tag_array[asmt->tag1] = 2;
+			asmt->input2_map_tag = asmt->tag1;
+			input_report_key(asmt->input2, BTN_TOUCH, asmt->touch1);
+			input_report_abs(asmt->input2, ABS_X, asmt->x1);
+			input_report_abs(asmt->input2, ABS_Y, asmt->y1);
+			input_sync(asmt->input2);
+		}
+		else {
+			asmt->tag_array[asmt->tag1] = 1;
+			asmt->input1_map_tag = asmt->tag1;
+			input_report_key(asmt->input1, BTN_TOUCH, asmt->touch1);
+			input_report_abs(asmt->input1, ABS_X, asmt->x1);
+			input_report_abs(asmt->input1, ABS_Y, asmt->y1);
+			input_sync(asmt->input1);
+		}
+	}
+
+	if (asmt->p2) {
+		if (asmt->tag_array[asmt->tag2] != 0x0000) {
+			if(asmt->tag_array[asmt->tag2] == 2) {
+				input_report_key(asmt->input2, BTN_TOUCH, asmt->touch2);
+				input_report_abs(asmt->input2, ABS_X, asmt->x2);
+				input_report_abs(asmt->input2, ABS_Y, asmt->y2);
+				input_sync(asmt->input2);
+			} else {
+				input_report_key(asmt->input1, BTN_TOUCH, asmt->touch2);
+				input_report_abs(asmt->input1, ABS_X, asmt->x2);
+				input_report_abs(asmt->input1, ABS_Y, asmt->y2);
+				input_sync(asmt->input1);
+			}
+		}
+	 	else {
+			/* 
+			 *   find a event which is not used
+			 */
+
+			if (asmt->input1_map_tag != 0x0000) {
+				asmt->tag_array[asmt->tag2] = 2;
+				asmt->input2_map_tag = asmt->tag2;
+				input_report_key(asmt->input2, BTN_TOUCH, asmt->touch2);
+				input_report_abs(asmt->input2, ABS_X, asmt->x2);
+				input_report_abs(asmt->input2, ABS_Y, asmt->y2);
+				input_sync(asmt->input2);
+			}
+			else {
+				asmt->tag_array[asmt->tag2] = 1;
+				asmt->input1_map_tag = asmt->tag2;
+				input_report_key(asmt->input1, BTN_TOUCH, asmt->touch2);
+				input_report_abs(asmt->input1, ABS_X, asmt->x2);
+				input_report_abs(asmt->input1, ABS_Y, asmt->y2);
+				input_sync(asmt->input1);
+			}
+		}
+	}
+	/****************
 
 	if (swap_xy) {
 		input_report_abs(asmt->input1, ABS_X, asmt->y1);
@@ -223,22 +329,27 @@ static void usbtouch_process_pkt(struct asus_mt_usb *asmt,
 		input_report_abs(asmt->input2, ABS_X, asmt->y2);
 		input_report_abs(asmt->input2, ABS_Y, asmt->x2);
 	} else {
+		input_report_key(asmt->input1, BTN_TOUCH, asmt->touch1);
 		input_report_abs(asmt->input1, ABS_X, asmt->x1);
 		input_report_abs(asmt->input1, ABS_Y, asmt->y1);
 
 		if(asmt->p2) {
+			input_report_key(asmt->input2, BTN_TOUCH, asmt->touch2);
 			input_report_abs(asmt->input2, ABS_X, asmt->x2);
 			input_report_abs(asmt->input2, ABS_Y, asmt->y2);
 		}
 	}
+	******************/
 	/*
 	 * if (type->max_press)
 	 *
 	 * input_report_abs	input_report_abs(asmt->input, ABS_PRESSURE, asmt->press);
 	 */
+	/*
 	input_sync(asmt->input1);
 	if(asmt->p2)
 		input_sync(asmt->input2);
+	*/
 }
 
 #define USB_REQ_SET_REPORT 0x09
