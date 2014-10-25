@@ -55,17 +55,19 @@ struct data_queue {
 
 struct data_queue queue[MAXQUEUE];
 
-static int swap_xy;
+static bool swap_xy;
 module_param(swap_xy, bool, 0644);
 MODULE_PARM_DESC(swap_xy, "If set X and Y axes are swapped.");
 
 struct asus_mt_usb {
 	unsigned char *data;
+	unsigned int data_size;
 	struct	input_dev *input1, *input2;
 	struct asmt_device_info *type;
 	struct usb_device *udev;
 	dma_addr_t data_dma;
 	struct urb *urb;
+	struct usb_interface *interface;
 	char name[128];
 	char phys0[64];
 	char phys1[64];
@@ -99,12 +101,14 @@ struct asmt_device_info {
 	int (*init)(struct asus_mt_usb *asmt);
 };
 
-static int insert_queue(void)
+static int insert_queue(struct asus_mt_usb *asmt)
 {
 	int i;
+	struct device *dev = &asmt->interface->dev;
 
 	if ((head + 1) == tail) {
-		printk("data_queue is full, some data are losed\n");
+		dev_dbg(dev, "%s: data_queue is full, some data are losed\n",
+			__func__);
 		return -1;
 	} else {
 		head = (head + 1) % MAXQUEUE;
@@ -133,8 +137,8 @@ empty:
 	return -1;
 }
 
-static int asus_mt_ioctl(struct inode *inode, struct file *file,
-				unsigned int cmd, unsigned long arg)
+static long asus_mt_ioctl(struct file *file, unsigned int cmd,
+			  unsigned long arg)
 {
 	ready = 0;
 	printk("asus_mt...ioctl\n");
@@ -167,7 +171,7 @@ static int asus_mt_release(struct inode *inode, struct file *file)
 
 static const struct file_operations asus_mt_fops = {
 	.owner = THIS_MODULE,
-	.ioctl = asus_mt_ioctl,
+	.unlocked_ioctl = asus_mt_ioctl,
 	.open = asus_mt_open,
 	.release = asus_mt_release,
 };
@@ -179,7 +183,7 @@ static int asus_read_data(struct asus_mt_usb *dev, unsigned char *pkt)
 	axies_data[1] = pkt[5] & 0x0F;
 	axies_data[2] = pkt[6];
 	axies_data[3] = pkt[7] & 0x0F;
-	insert_queue();
+	insert_queue(dev);
 
 	dev->x1 = ((pkt[5] & 0x0F) << 8) | (pkt[4] & 0xFF);
 	dev->y1 = ((pkt[7] & 0x0F) << 8) | (pkt[6] & 0xFF);
@@ -202,7 +206,7 @@ static struct asmt_device_info type = {
 		.max_xc		= 0x0fff,
 		.min_yc		= 0x0,
 		.max_yc		= 0x0fff,
-		.rept_size	= 8,
+		.rept_size	= 16,
 		.read_data	= asus_read_data,
 };
 
@@ -329,15 +333,15 @@ static int usb_set_report_feature(struct usb_interface *intf,
 
 static void asus_mt_irq(struct urb *urb)
 {
-	struct asus_mt_usb *asmt = urb->context;
 	int retval;
-	unsigned char *data = asmt->data;
+	struct asus_mt_usb *asmt = urb->context;
+	struct device *dev = &asmt->interface->dev;
 
 	switch (urb->status) {
 	case 0:
 		break;
 	case -ETIME:
-		dbg("%s - urb timed out - was the device unplugged?",
+		dev_dbg(dev, "%s - urb timed out - was the device unplugged?",
 		    __func__);
 		return;
 	case -ECONNRESET:
@@ -352,7 +356,7 @@ static void asus_mt_irq(struct urb *urb)
 resubmit:
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
 	if (retval)
-		err("%s - usb_submit_urb failed with result: %d",
+		dev_dbg(dev, "%s - usb_submit_urb failed with result: %d",
 		    __func__, retval);
 }
 
@@ -364,24 +368,29 @@ static int asus_probe(struct usb_interface *intf,
 	struct usb_host_interface *interface = intf->cur_altsetting;
 	struct usb_device *dev = interface_to_usbdev(intf);
 	struct input_dev *input_dev1, *input_dev2;
-	int n = 0, insize = 16;
+	struct asus_mt_usb *asmt;
+	int n = 0;
 	char *buf;
+	int err = -ENOMEM;
 
 	asus_mt_major = register_chrdev(0, ASUS_MT_STRING,
 			&asus_mt_fops);
 
 	if (asus_mt_major < 0) {
-		printk("Unable to get a major"
-		       " for ASUS multi-touch driver!\n");
+		dev_dbg(&intf->dev,
+		"%s: Unable to get a major for ASUS multi-touch driver!\n",
+		__func__);
 		return asus_mt_major;
 	}
 
 	asus_mt_class = class_create(THIS_MODULE, ASUS_MT_STRING);
 
 	if (IS_ERR(asus_mt_class)) {
-		printk(KERN_ERR "Error creating Asus Multi-Touch class.\n");
+		dev_dbg(&intf->dev,
+			"%s: Error creating Asus Multi-Touch class.\n",
+			__func__);
 		ret = PTR_ERR(asus_mt_class);
-		goto err_out1;
+		goto err_class_create;
 	}
 
 	temp_class = device_create(asus_mt_class, NULL,
@@ -389,13 +398,22 @@ static int asus_probe(struct usb_interface *intf,
 					NULL,  ASUS_MT_STRING);
 
 	if (IS_ERR(temp_class)) {
-		printk(KERN_ERR "Error creating Asus Multi-Touch class device.\n");
+		dev_dbg(&intf->dev,
+			"%s: Error creating Asus Multi-Touch class device.\n",
+			__func__);
 		ret = PTR_ERR(temp_class);
-		goto err_out2;
+		goto out_device_create;
 	}
 
-	struct asus_mt_usb *asmt = kzalloc(sizeof(struct asus_mt_usb),
-					   GFP_KERNEL);
+	asmt = kzalloc(sizeof(struct asus_mt_usb), GFP_KERNEL);
+	input_dev1 = input_allocate_device();
+	input_dev2 = input_allocate_device();
+
+	if (!asmt || !input_dev1 || !input_dev2) {
+		dev_dbg(&intf->dev, "%s: Memory is not enough\n", __func__);
+		goto out_free;
+	}
+
 	asmt->type = &type;
 	asmt->udev = dev;
 
@@ -420,13 +438,11 @@ static int asus_probe(struct usb_interface *intf,
 	strlcat(asmt->phys1, "/input1", sizeof(asmt->phys1));
 
 	if (!asmt->type->process_pkt) {
-		printk("process_pkt is null\n");
+		dev_dbg(&intf->dev, "%s: process_pkt is null\n", __func__);
 		asmt->type->process_pkt = usbtouch_process_pkt;
 	}
 
 	usb_set_intfdata(intf, asmt);
-	input_dev1 = input_allocate_device();
-	input_dev2 = input_allocate_device();
 	input_dev1->name = asmt->name;
 	input_dev2->name = asmt->name;
 	usb_to_input_id(dev, &input_dev1->id);
@@ -434,10 +450,6 @@ static int asus_probe(struct usb_interface *intf,
 	asmt->input1 = input_dev1;
 	asmt->input2 = input_dev2;
 
-	if (!asmt || !input_dev1 || !input_dev2) {
-		printk("Memory is not enough\n");
-		goto fail1;
-	}
 
 	input_dev1->dev.parent = &intf->dev;
 	input_set_drvdata(input_dev1, asmt);
@@ -459,12 +471,13 @@ static int asus_probe(struct usb_interface *intf,
 	input_set_abs_params(input_dev2, ABS_Y, asmt->type->min_yc,
 			     asmt->type->max_yc, 0, 0);
 
-	asmt->data = usb_buffer_alloc(dev, insize, GFP_KERNEL,
+	asmt->data_size = type.rept_size;
+	asmt->data = usb_alloc_coherent(dev, asmt->data_size, GFP_KERNEL,
 			&asmt->data_dma);
 
 	if (!asmt->data) {
-		printk("asmt->data allocating fail");
-		goto fail;
+		dev_dbg(&intf->dev, "%s: asmt->data allocating fail", __func__);
+		goto out_free;
 	}
 
 	for (n = 0; n < interface->desc.bNumEndpoints; n++) {
@@ -483,45 +496,74 @@ static int asus_probe(struct usb_interface *intf,
 				continue;
 			asmt->urb = usb_alloc_urb(0, GFP_KERNEL);
 			if (!asmt->urb)
-				goto fail;
+				goto out_free_coherent;
 			pipe = usb_rcvintpipe(dev, endpoint->bEndpointAddress);
 			usb_fill_int_urb(asmt->urb, dev, pipe, asmt->data,
-					 insize, asus_mt_irq, asmt, interval);
+					 asmt->data_size, asus_mt_irq,
+					 asmt, interval);
 			asmt->urb->transfer_dma = asmt->data_dma;
 			asmt->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 		}
 	}
 
+	err = input_register_device(asmt->input1);
+	if (err) {
+		dev_dbg(&intf->dev,
+			"%s - input_register_device failed, err: %d\n",
+			__func__, err);
+		goto out_input;
+	}
+	input_register_device(asmt->input2);
+	if (err) {
+		dev_dbg(&intf->dev,
+			"%s - input_register_device failed, err: %d\n",
+			__func__, err);
+		goto out_input;
+	}
+
 	/* 8 bytes are enough for both products */
 	buf = kmalloc(8, GFP_KERNEL);
+	if (!buf)
+		goto out_buf;
+
 	buf[0] = 0x07;
 	buf[1] = 0x02;
 	if (usb_set_report_feature(intf, 2, 7, buf, 8))
-		printk("set report true\n");
+		dev_dbg(&intf->dev, "%s: set report true\n", __func__);
 	else
-		printk("set report false\n");
+		dev_dbg(&intf->dev, "%s set report false\n", __func__);
 
-	if (usb_submit_urb(asmt->urb, GFP_ATOMIC)) {
-		printk("usb submit urb error\n");
-		return -EIO;
+	err = usb_submit_urb(asmt->urb, GFP_ATOMIC);
+	if (err) {
+		dev_err(&intf->dev,
+			"%s: usb_submit_urb failed with error: %d\n",
+			__func__, err);
+		goto out_fail;
 	}
 
-	input_register_device(asmt->input1);
-	input_register_device(asmt->input2);
+out_buf:
+	kfree(buf);
 	return 0;
-fail:
+
+out_fail:
+	input_unregister_device(input_dev2);
+	input_unregister_device(input_dev1);
+	input_dev2 = NULL;
+	input_dev1 = NULL;
+out_input:
 	usb_free_urb(asmt->urb);
-	asmt->urb = NULL;
-	usb_buffer_free(dev, insize, asmt->data, asmt->data_dma);
-fail1:
+out_free_coherent:
+	usb_free_coherent(dev, asmt->data_size,
+			  asmt->data, asmt->data_dma);
+out_free:
 	input_free_device(input_dev1);
 	input_free_device(input_dev2);
 	kfree(asmt);
-err_out2:
+out_device_create:
 	class_destroy(asus_mt_class);
-err_out1:
+err_class_create:
 	unregister_chrdev(asus_mt_major, ASUS_MT_STRING);
-	return 1;
+	return err;
 }
 
 static void asus_disconnect(struct usb_interface *intf)
@@ -535,7 +577,7 @@ static void asus_disconnect(struct usb_interface *intf)
 		input_unregister_device(asmt->input1);
 		usb_kill_urb(asmt->urb);
 		usb_free_urb(asmt->urb);
-		usb_buffer_free(interface_to_usbdev(intf), 14,
+		usb_free_coherent(interface_to_usbdev(intf), asmt->data_size,
 				asmt->data, asmt->data_dma);
 		kfree(asmt);
 	}
@@ -556,13 +598,11 @@ static struct usb_driver asus_driver = {
 
 static int asus_init(void)
 {
-	printk("asus_init\n");
 	return usb_register(&asus_driver);
 }
 
 static void asus_exit(void)
 {
-	printk("asus_exit\n");
 	usb_deregister(&asus_driver);
 }
 
